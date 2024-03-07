@@ -1,0 +1,53 @@
+from flask import Flask, request, jsonify
+import requests
+import json
+
+app = Flask(__name__)
+
+def classify_ticket(text):
+    api_key = "your_api_key_here"
+    endpoint = "https://api.openai.com/v1/completions"  # Update with your actual endpoint URL
+    
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}"
+    }
+    
+    # Synthetic dataset examples for few-shot learning
+    prompt = f"""The following are customer service tickets with their classifications as Automatable or Not Automatable:
+    1. "Can you reset my password?" - Automatable
+    2. "I believe my account has been compromised." - Not Automatable
+    3. "How do I sign up for a new account?" - Automatable
+    4. "There's an error with my payment." - Not Automatable
+    
+    Given the customer service ticket: "{text}", is it Automatable or Not Automatable?
+    """
+    
+    data = {
+        "model": "text-davinci-003",  # Choose the appropriate model version
+        "prompt": prompt,
+        "temperature": 0.5,
+        "max_tokens": 60,
+        "top_p": 1.0,
+        "frequency_penalty": 0.0,
+        "presence_penalty": 0.0
+    }
+    
+    response = requests.post(endpoint, headers=headers, data=json.dumps(data))
+    result = response.json()
+    
+    classification = result.get("choices", [{}])[0].get("text", "").strip()
+    return classification
+
+@app.route('/classify_ticket', methods=['POST'])
+def api_classify_ticket():
+    data = request.get_json()
+    ticket_text = data.get("text")
+    if not ticket_text:
+        return jsonify({"error": "No ticket text provided"}), 400
+    
+    classification = classify_ticket(ticket_text)
+    return jsonify({"classification": classification})
+
+if __name__ == "__main__":
+    app.run(debug=True, host='0.0.0.0', port=5000)
