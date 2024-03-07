@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Customer Ticket Classification</title>
+</head>
+<body>
+    <h2>Customer Ticket Classifier</h2>
+    <form action="/classify_ticket" method="post">
+        <label for="ticketText">Enter Ticket Text:</label><br>
+        <textarea id="ticketText" name="text" rows="4" cols="50"></textarea><br>
+        <input type="submit" value="Classify">
+    </form>
+    <h3>Classification Result:</h3>
+    <textarea id="classificationResult" name="classificationResult" rows="2" cols="50" readonly>{{ classification }}</textarea>
+</body>
+</html>
