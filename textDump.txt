@@ -1,0 +1,2 @@
+create a detailed prompt using CO-STAR framework for the following task.
+Search online and give me the top 10 courses which covers Generative AI from beginner to advanced. I am very good with Python. The courses need to be top notch quality, have to be highly reputed, preferable have a certificate at the end of the course. If certificate is not available, then lecture playlist on Youtube will also work. The search has to be extremely through
