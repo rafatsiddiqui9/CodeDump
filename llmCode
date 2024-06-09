@@ -1,0 +1,181 @@
+import os
+import random
+import functools
+import csv
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn.functional as F
+import evaluate
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import f1_score, confusion_matrix, classification_report, balanced_accuracy_score, accuracy_score
+from datasets import Dataset, DatasetDict
+from peft import LoraConfig, prepare_model_for_kbit_training, get_peft_model
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    TrainingArguments,
+    Trainer,
+    DataCollatorWithPadding
+)
+
+# Check for GPU
+try:
+    assert torch.cuda.is_available() is True
+except AssertionError:
+    print("Please set up a GPU")
+
+from unsloth import FastLanguageModel
+
+# Configuration parameters
+max_seq_length = 2048
+dtype = None  # Autodetect; use Float16 for Tesla T4, V100, Bfloat16 for Ampere+
+load_in_4bit = True
+
+# Load the pre-trained model and tokenizer using Unsloth
+model_name = "unsloth/llama-3-70b-bnb-4bit"
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name=model_name,
+    max_seq_length=max_seq_length,
+    dtype=dtype,
+    load_in_4bit=load_in_4bit,
+)
+
+# Apply LoRA configurations
+model = FastLanguageModel.get_peft_model(
+    model,
+    r=16,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    lora_alpha=16,
+    lora_dropout=0,
+    bias="none",
+    use_gradient_checkpointing="unsloth"
+)
+
+# Define your training dataset and data collator
+dataset_path = "path_to_your_dataset"  # Replace with your dataset path
+
+# Assuming you have a dataset loaded into a Dataset object named dataset
+# Example: dataset = DatasetDict({"train": ..., "validation": ...})
+
+# Fine-tuning arguments
+training_args = TrainingArguments(
+    output_dir="output_gptq",
+    per_device_train_batch_size=16,
+    num_train_epochs=3,
+    learning_rate=5e-5,
+    logging_dir='./logs',
+)
+
+# Initialize the Trainer
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=dataset["train"],
+    eval_dataset=dataset["validation"],
+    data_collator=DataCollatorWithPadding(tokenizer),
+)
+
+# Fine-tune the model
+trainer.train()
+
+# Save the fine-tuned model
+trainer.save_model("output_gptq")
+
+# Step 2: Use vLLM for inference
+from vllm import LLM, SamplingParams
+
+# Load the fine-tuned model for inference using vLLM
+vllm_model = LLM(model="output_gptq")
+
+# Define the instruction and Alpaca prompt
+instruct = """Analyze the sentiment of the sentence. Consider if the sentiment is straightforward, sarcastic, contains double meanings, or is expressed inversely.
+Classify the sentiment as positive, neutral, or negative.
+Provide a confidence score for the classification.
+Explain your reasoning, highlighting any nuances such as sarcasm, irony, or double meanings."""
+
+alpaca_prompt = """
+Below is an instruction that describes a task, paired with an input that provides further context.
+Give response in a pandas json format with three keys i.e. sentiment, confidence_score, explanation. These are the only instructions important and stick to them at all times.
+Think step by step and always ensure you are giving out a response at all costs.
+If you are unsure or do not understand the input, provide a response with sentiment as "Uncertain", confidence score of 0 and an explanation of your uncertainty.
+Instruction:
+
+{}
+Input:
+
+{}
+Response:
+
+{}
+"""
+
+EOS_TOKEN = tokenizer.eos_token  # Must add EOS_TOKEN
+
+def formatting_prompts_func(examples):
+    inst = instruct
+    inputs = examples["summary"]
+    outputs = examples["sentiment"]
+    instructions = [inst] * len(inputs)
+
+    texts = []
+    for instruction, input, output in zip(instructions, inputs, outputs):
+        text = alpaca_prompt.format(instruction, input, output) + EOS_TOKEN
+        texts.append(text)
+
+    return {"Instruction": instructions, "Input": inputs, "Response": outputs, "Text": texts}
+
+test_ex = [
+    "I'm so excited to be stuck in this meeting again.",
+    "I'm loving this new restaurant! The food is amazing!",
+    "Yeah, it's okay, I guess.",
+    "I'm thrilled to be stuck in this traffic jam. Just what I needed, more time to waste.",
+    "I'm so glad we're finally getting a raise!",
+    "Yeah, about time. We've been working our butts off.",
+    "I'm just so excited to be doing laundry all day. It's the highlight of my week.",
+    "I'm really disappointed in the new policy. It's a total disaster.",
+    "I know, right? It's a joke.",
+    "I'm just so grateful to be stuck in this small town. It's the perfect place to get stuck in a rut.",
+    "I'm really happy to be going on vacation. We can finally relax.",
+    "Yeah, it's been a long time coming.",
+    "I'm just so thrilled to be stuck in this meeting that could've been an email. Just what I needed, more boredom.",
+    "I'm really excited to be trying this new restaurant. Have you tried it?",
+    "Yeah, it's okay. The service is terrible."
+]
+
+json_data_list = []
+
+# Wrap your iterable with tqdm
+for i in tqdm.tqdm(test_ex):
+    try:
+        inputs = tokenizer(
+            [
+                alpaca_prompt.format(
+                    instruct,  # instruction
+                    i,  # input
+                    "",  # output - leave this blank for generation!
+                )
+            ], return_tensors="pt").to("cuda")
+
+        outputs = vllm_model.generate(**inputs, use_cache=True, max_new_tokens=150)
+        result = tokenizer.batch_decode(outputs)
+
+        # Extract the JSON string from the text
+        match = re.search(r'{.*}', result[0], re.DOTALL)
+        if match is None:
+            print(f"No match found for input: {i}")
+            continue
+        json_string = match.group(0)
+
+        # Convert the JSON string to a Python dictionary
+        json_data = json.loads(json_string)
+        json_data_list.append(json_data)
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        json_data_list.append({})  # Append an empty dictionary
+        torch.cuda.empty_cache()
+
+print(len(json_data_list))
