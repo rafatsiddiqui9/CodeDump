@@ -1,0 +1,187 @@
+# Install required packages
+!pip install mlflow datasets transformers peft unsloth trl evaluate torch --upgrade --no-cache-dir
+
+# Import required libraries
+import mlflow
+from unsloth import FastLanguageModel
+import torch
+from datasets import load_dataset
+from transformers import TrainingArguments, AutoTokenizer
+from unsloth import is_bfloat16_supported
+from trl import SFTTrainer
+import evaluate
+import numpy as np
+from sklearn.metrics import confusion_matrix, classification_report
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Initialize MLflow
+mlflow.set_tracking_uri("file:///mnt/data/mlruns")
+mlflow.set_experiment("your_experiment_name")
+
+# Set up model configuration
+max_seq_length = 2048 # Choose any! We auto support RoPE Scaling internally!
+dtype = None # None for auto detection. Float16 for Tesla T4, V100, Bfloat16 for Ampere+
+load_in_4bit = True # Use 4bit quantization to reduce memory usage. Can be False.
+
+# 4bit pre-quantized models
+fourbit_models = [
+    "unsloth/mistral-7b-v0.3-bnb-4bit",
+    "unsloth/mistral-7b-instruct-v0.3-bnb-4bit",
+    "unsloth/llama-3-8b-bnb-4bit",
+    "unsloth/llama-3-8b-Instruct-bnb-4bit",
+    "unsloth/llama-3-70b-bnb-4bit",
+    "unsloth/Phi-3-mini-4k-instruct",
+    "unsloth/Phi-3-medium-4k-instruct",
+    "unsloth/mistral-7b-bnb-4bit",
+    "unsloth/gemma-7b-bnb-4bit",
+]
+
+# Load model and tokenizer
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name="meta-llama/Meta-Llama-3-8B",
+    max_seq_length=max_seq_length,
+    dtype=dtype,
+    load_in_4bit=load_in_4bit,
+    token="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", # use one if using gated models like meta-llama/Llama-2-7b-hf
+)
+model = FastLanguageModel.get_peft_model(
+    model,
+    r=16, # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                    "gate_proj", "up_proj", "down_proj"],
+    lora_alpha=16,
+    lora_dropout=0, # Supports any, but = 0 is optimized
+    bias="none",    # Supports any, but = "none" is optimized
+    use_gradient_checkpointing="unsloth", # True or "unsloth" for very long context
+    random_state=3407,
+    use_rslora=False,  # We support rank stabilized LoRA
+    loftq_config=None, # And LoftQ
+)
+
+# Define prompt and EOS token
+alpaca_prompt = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+
+### Instruction:
+{}
+
+### Input:
+{}
+
+### Response:
+{}"""
+EOS_TOKEN = tokenizer.eos_token
+
+# Formatting prompts function
+def formatting_prompts_func(examples):
+    instructions = examples["instruction"]
+    inputs = examples["input"]
+    outputs = examples["output"]
+    texts = []
+    for instruction, input, output in zip(instructions, inputs, outputs):
+        text = alpaca_prompt.format(instruction, input, output) + EOS_TOKEN
+        texts.append(text)
+    return {"text": texts}
+
+# Load and format dataset
+sst5 = load_dataset("sst", split="train[:80%]")  # Adjusted to SST5 dataset
+sst5 = sst5.map(lambda example: {"label": 2 if example["label"] > 3 else (0 if example["label"] < 2 else 1)})  # Grouping into 3 labels
+
+# Define training arguments
+training_args = TrainingArguments(
+    per_device_train_batch_size=2,
+    gradient_accumulation_steps=4,
+    warmup_steps=5,
+    max_steps=2,
+    learning_rate=2e-4,
+    fp16=not is_bfloat16_supported(),
+    bf16=is_bfloat16_supported(),
+    logging_steps=1,
+    optim="adamw_8bit",
+    weight_decay=0.01,
+    lr_scheduler_type="linear",
+    seed=3407,
+    output_dir="outputs",
+)
+
+# Initialize trainer
+trainer = SFTTrainer(
+    model=model,
+    tokenizer=tokenizer,
+    train_dataset=sst5,
+    dataset_text_field="text",
+    max_seq_length=max_seq_length,
+    dataset_num_proc=2,
+    packing=False, # Can make training 5x faster for short sequences.
+    args=training_args,
+)
+
+# Start MLflow run and train model
+with mlflow.start_run():
+    trainer.train()
+    # Log parameters and metrics
+    mlflow.log_params({
+        "per_device_train_batch_size": training_args.per_device_train_batch_size,
+        "gradient_accumulation_steps": training_args.gradient_accumulation_steps,
+        "warmup_steps": training_args.warmup_steps,
+        "max_steps": training_args.max_steps,
+        "learning_rate": training_args.learning_rate,
+        "fp16": training_args.fp16,
+        "bf16": training_args.bf16,
+        "logging_steps": training_args.logging_steps,
+        "optim": training_args.optim,
+        "weight_decay": training_args.weight_decay,
+        "lr_scheduler_type": training_args.lr_scheduler_type,
+        "seed": training_args.seed,
+        "output_dir": training_args.output_dir,
+    })
+    mlflow.log_metric("final_loss", trainer.state.log_history[-1]['loss'])
+
+# Load validation and test sets
+val_set = load_dataset("sst", split="validation[:10%]")
+test_set = load_dataset("sst", split="test[:10%]")
+
+# Function to get predictions from vllm
+def get_vllm_predictions(model, tokenizer, dataset):
+    model.eval()
+    predictions, labels = [], []
+    for example in dataset:
+        inputs = tokenizer(example["text"], return_tensors="pt", max_length=max_seq_length, truncation=True, padding=True)
+        with torch.no_grad():
+            outputs = model(**inputs)
+        logits = outputs.logits
+        preds = torch.argmax(logits, dim=-1).item()
+        predictions.append(preds)
+        labels.append(example["label"])
+    return predictions, labels
+
+# Get predictions and true labels for validation and test sets
+val_predictions, val_labels = get_vllm_predictions(model, tokenizer, val_set)
+test_predictions, test_labels = get_vllm_predictions(model, tokenizer, test_set)
+
+# Calculate confusion matrix and classification report
+val_conf_matrix = confusion_matrix(val_labels, val_predictions)
+test_conf_matrix = confusion_matrix(test_labels, test_predictions)
+
+# Plot confusion matrix for validation set
+plt.figure(figsize=(10, 7))
+sns.heatmap(val_conf_matrix, annot=True, fmt='d', cmap='Blues', xticklabels=["Negative", "Neutral", "Positive"], yticklabels=["Negative", "Neutral", "Positive"])
+plt.xlabel('Predicted')
+plt.ylabel('Actual')
+plt.title('Validation Set Confusion Matrix')
+plt.show()
+
+# Plot confusion matrix for test set
+plt.figure(figsize=(10, 7))
+sns.heatmap(test_conf_matrix, annot=True, fmt='d', cmap='Blues', xticklabels=["Negative", "Neutral", "Positive"], yticklabels=["Negative", "Neutral", "Positive"])
+plt.xlabel('Predicted')
+plt.ylabel('Actual')
+plt.title('Test Set Confusion Matrix')
+plt.show()
+
+# Print classification reports
+print("Validation Set Classification Report:")
+print(classification_report(val_labels, val_predictions, target_names=["Negative", "Neutral", "Positive"]))
+
+print("Test Set Classification Report:")
+print(classification_report(test_labels, test_predictions, target_names=["Negative", "Neutral", "Positive"]))
